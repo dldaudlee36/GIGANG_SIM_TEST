@@ -40,7 +40,7 @@ LLM이 "이 회사에서 몇 명이 몇 번 썼는지"까지 알고 진단하게
 
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-from gigang.schemas.event import SecurityEvent, LogSource
+from gigang.schemas.event import SecurityEvent, LogSource, EventAction
 from gigang.schemas.incident import ShadowAIAsset, Severity, SanctionStatus
 
 
@@ -451,6 +451,14 @@ class ShadowAIGovernanceEngine:
         """
         # 도메인 정보가 없는 이벤트(DB 조회 등)는 거버넌스 대상이 아니므로 건너뛴다
         if event.log_source not in [LogSource.DNS, LogSource.WEB, LogSource.WINDOWS_AGENT, LogSource.CHROME_EXTENSION] or not event.target.domain:
+            return
+        # [추가됨] 기밀 DB 복사·캡처·다운로드는 외부 서비스 접속이 아니다 (target 이 사내 기밀 DB 주소).
+        #   걸러내지 않으면 기밀 DB 가 '미확인 외부 서비스' 자산으로 등록된다.
+        if event.action in (
+            EventAction.CLIPBOARD_COPY, EventAction.SCREEN_CAPTURE, EventAction.DB_DOWNLOAD,
+            EventAction.DB_IMAGE_CAPTURE, EventAction.COPY_ATTEMPT, EventAction.CLIPBOARD_CHANGED,
+            EventAction.DOWNLOAD_STARTED, EventAction.DOWNLOAD_COMPLETED, EventAction.DOWNLOAD_INTERRUPTED
+        ):
             return
 
         domain = event.target.domain.lower()

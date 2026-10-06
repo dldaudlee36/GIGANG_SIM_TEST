@@ -1,5 +1,5 @@
-﻿GIGANG Team v3.1
-Agent 3.0.0 / Chrome Extension 3.1.0
-2026-09-09
-Upstream: dldaudlee36/GIGANG main 64b6a908e21ec1233ce055112455be7e428348f3
+GIGANG 3.9.0 (Integrated Edition)
+- v3.8.3 Infrastructure: Image Guard / OCR, SiteAccess Whitelist, Lifecycle & Launchers
+- GIGANG-main Core Engine: Department Policies (CS/HR/FIN/DEV), Dynamic Scoring, DL-1~3, SS-1~3, Incident Timeline UI
+Agent: 3.9.0; Chrome Extension: 3.9.0
 Dashboard: http://127.0.0.1:8501

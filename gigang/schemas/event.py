@@ -76,7 +76,18 @@ class EventAction(str, Enum):
     HTTP_POST = "HTTP_POST"                         # 웹 전송 (대용량이면 유출 의심)
     WEB_ACCESS = "WEB_ACCESS"                       # 사이트 접속 (Agent가 DNS 캐시에서 감지)
     FILE_UPLOAD_ATTEMPT = "FILE_UPLOAD_ATTEMPT"     # 파일 첨부 시도 ★ 크롬 확장이 감지
+    DOWNLOAD_STARTED = "DOWNLOAD_STARTED"
+    DOWNLOAD_COMPLETED = "DOWNLOAD_COMPLETED"
+    DOWNLOAD_INTERRUPTED = "DOWNLOAD_INTERRUPTED"
+    DB_IMAGE_CAPTURE = "DB_IMAGE_CAPTURE"
+    COPY_ATTEMPT = "COPY_ATTEMPT"
+    CLIPBOARD_CHANGED = "CLIPBOARD_CHANGED"
     PASTE_ATTEMPT = "PASTE_ATTEMPT"                 # 대량 텍스트 붙여넣기 ★ 크롬 확장이 감지 [추가됨]
+
+    # --- 기밀 DB 반출 관련 (Agent가 감지) [추가됨] ---
+    CLIPBOARD_COPY = "CLIPBOARD_COPY"               # 기밀 DB 텍스트 복사 (규칙별 건수)
+    SCREEN_CAPTURE = "SCREEN_CAPTURE"               # 기밀 DB 화면 캡처 (단축키·이미지 크기만)
+    DB_DOWNLOAD = "DB_DOWNLOAD"                     # 기밀 DB에서 파일 다운로드 (이름·크기·형식·규칙별 건수)
 
 
 class Actor(BaseModel):

@@ -19,13 +19,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Exclude walkthroughs & tools
+# User docs and screenshots
 walkthroughs/
-tools/
-
-*.bat
 *.ps1
-*.png
 !docs/screenshots/*.png
 *_backup*.py
 *.db
@@ -34,3 +30,5 @@ tools/
 .env
 .env.*
 !.env.example
+backups/
+tools/git/

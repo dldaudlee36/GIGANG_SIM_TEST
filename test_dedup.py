@@ -14,15 +14,16 @@ engine.store.clear_all()
 USER = "test_dedup_user"
 base = datetime.utcnow() - timedelta(minutes=5)
 
+# [수정됨 10-06] 예전엔 'DB 감사 로그 SELECT → AI 접속' 으로 WATCH 를 만들었는데, 그 경로는 기록만으로 바뀌었다.
+#   WATCH 는 기밀 DB 복사 규칙으로 만든다 (부서 정보 없는 사용자 → COM-2 WATCH).
 events = [
     SecurityEvent(
         event_id="EVT-DUP-1", timestamp=base,
-        log_source=LogSource.DB,
+        log_source=LogSource.WINDOWS_AGENT,
         actor=Actor(user_id=USER, src_ip="192.168.10.77"),
-        target=Target(dst_ip="10.0.0.30", dst_port=3306),
-        action=EventAction.SELECT,
-        payload=PayloadMetadata(table_name="customer_vault",
-                                query_string="SELECT * FROM customer_vault;"),
+        target=Target(domain="db.local"),
+        action=EventAction.CLIPBOARD_COPY,
+        payload=PayloadMetadata(extra={"pattern_hits": {"card": 1}, "text_length": 120}),
     ),
     SecurityEvent(
         event_id="EVT-DUP-2", timestamp=base + timedelta(seconds=60),

@@ -306,6 +306,15 @@ def fetch_railway_events(timeout: int = 5, force: bool = False) -> List[Dict[str
                 if not isinstance(pattern_hits, dict):
                     pattern_hits = {}   # 형식이 깨져 들어오면 빈 딕셔너리로 안전하게 처리
 
+                # [추가됨] 이미지 붙여넣기(장수·크기)와 끌어다 놓기 첨부(method=drop). 이미지 자체는 오지 않는다.
+                for key in ("image_count", "image_bytes"):
+                    value = item.get(key) if item.get(key) is not None else raw_info.get(key)
+                    try:
+                        item[key] = int(value) if value is not None else None
+                    except (ValueError, TypeError):
+                        item[key] = None
+                item["method"] = item.get("method") or raw_info.get("method")
+
                 # 4. 소스 정규화 (windows-agent / chrome-extension)
                 #    소스 정보가 빠진 로그는 이벤트 타입으로 역추론한다.
                 #    파일 첨부와 붙여넣기는 크롬 확장만 감지할 수 있으므로 chrome-extension이 된다.
@@ -357,6 +366,21 @@ _db_api_fetch_status: Dict[str, Any] = {
     "endpoint": "/api/db-logs/since",
     "last_after": None,
 }
+
+
+def fetch_railway_policy(timeout: int = 5) -> Optional[Dict[str, Any]]:
+    """
+    [추가됨] Railway 의 부서별 탐지 기준 표(GET /policies)를 읽는다.
+    표가 아직 없거나, 키가 없거나, 연결이 안 되면 None → 엔진은 로컬 department_policy.json 으로 판정한다.
+    """
+    url = RAILWAY_URL.rsplit("/events", 1)[0] + "/policies"
+    try:
+        response = requests.get(url, headers={"X-API-Key": get_railway_api_key()}, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def get_db_api_fetch_status() -> Dict[str, Any]:
@@ -575,6 +599,8 @@ def get_team_security_events() -> List[SecurityEvent]:
 
       DNS는 만들어지지 않는다. 파일 상단 '주의 2' 참고.
     """
+    from gigang.engine.correlation import is_generative_ai   # 엔진이 이 파일을 함수 안에서 불러오므로 여기서도 함수 안에서 불러온다
+
     railway_logs = fetch_railway_events()
     # 원격 DB 로그 API 우선 수집, 미설정/실패 시 로컬 activity.log 자동 폴백
     remote_db = fetch_remote_db_logs()
@@ -597,13 +623,48 @@ def get_team_security_events() -> List[SecurityEvent]:
 
         # 접속한 도메인이 생성형 AI로 보이는지 이름으로 판단한다.
         # 이 값에 따라 payload의 category가 달라지고, 화면 표시도 달라진다.
-        is_ai = any(k in domain.lower() for k in ["chatgpt", "openai", "claude", "gemini", "copilot", "perplexity", "ai"])
+        # [수정됨] 'ai' 글자 포함 검사 대신 엔진과 같은 기준을 쓴다 (mail.google.com 등이 AI로 표시되던 문제).
+        is_ai = is_generative_ai(domain)
 
         # 붙여넣기 / 파일 첨부 / 단순 접속 세 갈래로 변환한다.
         #
         # [추가됨] PASTE_ATTEMPT 분기가 반드시 파일첨부 분기보다 '앞에' 있어야 한다.
         #   아래 파일첨부 조건에 `source == "chrome-extension"` 이 들어 있어서,
         #   순서가 뒤바뀌면 붙여넣기 로그까지 전부 파일첨부로 잡혀버린다.
+        if ev_type == "CLIPBOARD_CHANGED":
+            events.append(SecurityEvent(
+                event_id=ev_id, timestamp=dt,
+                log_source=LogSource.WINDOWS_AGENT,
+                actor=Actor(user_id=user, src_ip=local_ip),
+                target=Target(hostname=pc),
+                action=EventAction.CLIPBOARD_CHANGED,
+                payload=PayloadMetadata(category="Clipboard_Change", extra={
+                    "pc_name": pc, "source": source,
+                    "client_event_time": item.get("client_event_time"),
+                    "clipboard_sequence": item.get("clipboard_sequence"),
+                }),
+                raw_message=f"{item.get('event_time')} user={user} pc={pc} event=CLIPBOARD_CHANGED",
+            ))
+            continue
+        elif ev_type in ("DB_IMAGE_CAPTURE", "COPY_ATTEMPT", "DOWNLOAD_STARTED", "DOWNLOAD_COMPLETED", "DOWNLOAD_INTERRUPTED"):
+            events.append(SecurityEvent(
+                event_id=ev_id, timestamp=dt,
+                log_source=LogSource.CHROME_EXTENSION,
+                actor=Actor(user_id=user, src_ip=local_ip),
+                target=Target(domain=domain, hostname=pc),
+                action=EventAction(ev_type),
+                payload=PayloadMetadata(category="Internal_DB_Action", extra={
+                    "source_path": item.get("source_path"),
+                    "detection_scope": item.get("detection_scope"),
+                    "download_id": item.get("download_id"),
+                    "download_state": item.get("download_state"),
+                    "pc_name": pc, "source": source,
+                    "client_event_time": item.get("client_event_time"),
+                }),
+                raw_message=f"{item.get('event_time')} user={user} pc={pc} event={ev_type} target={domain}",
+            ))
+            continue
+
         if ev_type == "PASTE_ATTEMPT":
             # 미승인 AI 사이트에서의 대량 텍스트 붙여넣기.
             # payload.extra 에 문자 수와 패턴 검출 개수만 담는다. 내용은 담지 않는다.
@@ -623,15 +684,56 @@ def get_team_security_events() -> List[SecurityEvent]:
                     payload=PayloadMetadata(
                         category="Shadow_AI_Paste" if is_ai else "Paste_Attempt",
                         extra={
+                            "trace_id": item.get("trace_id"),
+                            "match_status": item.get("match_status"),
+                            "match": item.get("match"),
+                            "image_guard": item.get("image_guard"),
+                            "authorization": item.get("authorization"),
                             "pc_name": pc,
                             "source": source,
                             "text_length": text_length,
                             "pattern_hits": pattern_hits,
+                            "image_count": item.get("image_count") or 0,
+                            "image_bytes": item.get("image_bytes") or 0,
                             "client_event_time": item.get("client_event_time"),
                             "risk_score": item.get("risk_score", 0)
                         }
                     ),
                     raw_message=f"{item.get('event_time')} user={user} pc={pc} ip={local_ip} event=PASTE_ATTEMPT target={domain} text_length={text_length} pattern_hits={pattern_hits}"
+                )
+            )
+        elif ev_type in ("CLIPBOARD_COPY", "SCREEN_CAPTURE", "DB_DOWNLOAD"):
+            # [추가됨] 기밀 DB 화면에서의 복사(규칙 검사 건수만) / 화면 캡처(단축키·이미지 크기만)
+            #   / 다운로드(파일 이름·크기·형식, 검사 가능하면 규칙 검사 건수).
+            #   판정은 engine/policy.py (시간창 → 부서 → 정책).
+            #   ※ 아래 else 로 흘러가면 사이트 접속(WEB_ACCESS)으로 잘못 잡히므로 반드시 여기서 처리한다.
+            #     DB_DOWNLOAD 는 source 가 windows-agent 라 파일첨부 분기로도 가지 않지만, 순서상 여기서 먼저 처리한다.
+            raw_info = _parse_raw_data(item.get("raw_data"))
+            if ev_type in ("CLIPBOARD_COPY", "DB_DOWNLOAD"):
+                pattern_hits = item.get("pattern_hits") or {}
+                extra = {"text_length": item.get("text_length") or 0,
+                         "pattern_hits": pattern_hits if isinstance(pattern_hits, dict) else {}}
+                detail = f"text_length={extra['text_length']} pattern_hits={extra['pattern_hits']}"
+                if ev_type == "DB_DOWNLOAD":
+                    extra.update(file_name=file_name, file_size=file_size, inspectable=raw_info.get("inspectable") is True,
+                                 file_kind=raw_info.get("file_kind"), reason=raw_info.get("reason"))
+                    detail = f"file={file_name} size={file_size}B kind={extra['file_kind']} " + (
+                        detail if extra["inspectable"] else f"inspectable=False reason={extra['reason']}")
+            else:
+                extra = {key: raw_info.get(key) for key in ("shortcut", "image_width", "image_height")}
+                detail = f"shortcut={extra['shortcut']} size={extra['image_width']}x{extra['image_height']}"
+            extra.update(pc_name=pc, source=source, client_event_time=item.get("client_event_time"))
+            events.append(
+                SecurityEvent(
+                    event_id=ev_id,
+                    timestamp=dt,
+                    log_source=LogSource.WINDOWS_AGENT,
+                    actor=Actor(user_id=user, src_ip=local_ip),
+                    target=Target(domain=domain, hostname=pc),
+                    action=EventAction(ev_type),
+                    payload=PayloadMetadata(category="Confidential_DB_Export", extra=extra,
+                                            file_name=extra.get("file_name"), file_size=extra.get("file_size")),
+                    raw_message=f"{item.get('event_time')} user={user} pc={pc} ip={local_ip} event={ev_type} target={domain} {detail}"
                 )
             )
         elif ev_type == "FILE_UPLOAD_ATTEMPT" or source == "chrome-extension":
@@ -649,11 +751,19 @@ def get_team_security_events() -> List[SecurityEvent]:
                         bytes_sent=file_size,
                         category="Shadow_AI_Exfiltration" if is_ai else "File_Upload_Attempt",
                         extra={
+                            "trace_id": item.get("trace_id"),
+                            "match_status": item.get("match_status"),
+                            "match": item.get("match"),
+                            "image_guard": item.get("image_guard"),
+                            "authorization": item.get("authorization"),
                             "pc_name": pc,
                             "source": source,
                             "file_name": file_name,
                             "file_size": file_size,
                             "file_size_formatted": item.get("file_size_formatted", "-"),
+                            "method": item.get("method") or "input",   # [추가됨] drop = 끌어다 놓기
+                            # [추가됨] Agent 가 기밀 DB에서 받은 파일과 이름·크기가 같다고 표시한 경우 (DL-3)
+                            "confidential_source": _parse_raw_data(item.get("raw_data")).get("confidential_source"),
                             "risk_score": item.get("risk_score", 0)
                         }
                     ),

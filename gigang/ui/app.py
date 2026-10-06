@@ -20,6 +20,98 @@ from gigang.storage import get_context
 from gigang.schemas import Severity, SanctionStatus, IncidentStatus, Incident
 from gigang.schemas.event import SecurityEvent, LogSource, EventAction, Actor, Target, PayloadMetadata
 
+# GIGANG Chrome enforcement policy. The local Agent exposes this file to the
+# browser extension; no pasted/file content is stored here, only hostnames.
+_BROWSER_POLICY_FILE = _root_dir / "runtime" / "blocked_domains.json"
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_root_dir / ".env")
+except Exception:
+    pass
+
+def _config_value(name: str, default: str = "") -> str:
+    import os
+    value = os.getenv(name, "")
+    if value:
+        return value
+    try:
+        value = str(st.secrets.get(name, ""))
+        if value:
+            return value
+    except Exception:
+        pass
+    return default
+
+_RAILWAY_EVENTS_URL = _config_value("RAILWAY_URL", "https://bountiful-nature-production-22ec.up.railway.app/events")
+_RAILWAY_BASE_URL = _RAILWAY_EVENTS_URL.rsplit("/", 1)[0] if _RAILWAY_EVENTS_URL.rstrip("/").endswith("/events") else _RAILWAY_EVENTS_URL.rstrip("/")
+_RAILWAY_POLICY_URL = _config_value("RAILWAY_POLICY_URL", _RAILWAY_BASE_URL + "/policy")
+_RAILWAY_API_KEY = _config_value("RAILWAY_API_KEY", "")
+
+def _normalize_policy_domain(domain: str) -> str:
+    value = (domain or "").strip().lower()
+    value = value.removeprefix("https://").removeprefix("http://")
+    value = value.split("/", 1)[0].split(":", 1)[0].strip(".")
+    return value
+
+def _load_browser_blocklist() -> set:
+    try:
+        import json
+        payload = json.loads(_BROWSER_POLICY_FILE.read_text(encoding="utf-8"))
+        items = payload.get("blocked_domains", []) if isinstance(payload, dict) else []
+        return {_normalize_policy_domain(item) for item in items if isinstance(item, str) and _normalize_policy_domain(item)}
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return set()
+
+def _set_browser_block_policy(domain: str, blocked: bool) -> None:
+    normalized = _normalize_policy_domain(domain)
+    if not normalized:
+        return
+    domains = _load_browser_blocklist()
+    if blocked:
+        domains.add(normalized)
+    else:
+        domains.discard(normalized)
+    _BROWSER_POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    import json
+    payload = {
+        "blocked_domains": sorted(domains),
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    temp = _BROWSER_POLICY_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(_BROWSER_POLICY_FILE)
+
+def _set_central_browser_policy(domain: str, blocked: bool) -> tuple:
+    import requests
+    normalized = _normalize_policy_domain(domain)
+    if not normalized:
+        return False, "도메인 형식이 올바르지 않습니다."
+    if not _RAILWAY_API_KEY:
+        return False, "RAILWAY_API_KEY가 설정되어 있지 않습니다."
+    try:
+        response = requests.post(
+            _RAILWAY_POLICY_URL,
+            json={"domain": normalized, "blocked": bool(blocked)},
+            headers={"X-API-Key": _RAILWAY_API_KEY},
+            timeout=6,
+        )
+        if response.status_code == 404:
+            return False, "Railway에 중앙 정책 API(/policy)가 아직 배포되지 않았습니다."
+        if response.status_code == 401:
+            return False, "Railway 정책 API 인증에 실패했습니다. RAILWAY_API_KEY를 확인하세요."
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("domain") != normalized:
+            return False, "Railway 정책 응답 형식이 올바르지 않습니다."
+        _set_browser_block_policy(normalized, blocked)
+        return True, "중앙 정책 저장 완료"
+    except requests.RequestException as error:
+        return False, f"Railway 정책 서버 연결 실패 ({type(error).__name__})"
+    except (ValueError, TypeError):
+        return False, "Railway 정책 응답을 읽지 못했습니다."
+
+
 # 데이터프레임 내 검색 강조 색상을 선명한 골드 옐로우(rgba(250,204,21,0.65))로 보장
 def _ensure_vivid_search_highlight():
     try:
@@ -2873,6 +2965,12 @@ if menu == "종합 관제":
                     "inner_border": "rgba(16, 185, 129, 0.25)",
                 }
 
+            inc_created_time = (
+                selected_inc.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                if hasattr(selected_inc.created_at, "strftime")
+                else str(selected_inc.created_at)
+            )
+
             st.markdown(f"""
             <div style="background: {card_theme['bg']}; border: 1px solid {card_theme['border']}; border-left: 5px solid {card_theme['border_left']}; border-radius: 20px; padding: 22px 28px; margin-top: 16px; margin-bottom: 12px; backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 25px {card_theme['glow']};">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
@@ -2889,7 +2987,7 @@ if menu == "종합 관제":
                     {card_theme['badge']}
                     <span style="font-size: 17px; font-weight: 700; color: #f8fafc; line-height: 1.4;">{selected_inc.title}</span>
                 </div>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; background: rgba(10, 16, 28, 0.65); backdrop-filter: blur(14px); padding: 16px 22px; border-radius: 14px; border: 1px solid rgba(255, 255, 255, 0.08);">
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; background: rgba(10, 16, 28, 0.65); backdrop-filter: blur(14px); padding: 16px 22px; border-radius: 14px; border: 1px solid rgba(255, 255, 255, 0.08);">
                     <div style="font-size: 13px; color: #94a3b8; display:flex; align-items:center;">
                         <span style="font-size:15px; margin-right:8px;">📍</span> <b>공격 발원지:</b> <span style="color:{card_theme['actor_color']}; font-weight:700; font-size:14px; margin-left:6px;">{selected_inc.actor}</span>
                     </div>
@@ -2898,6 +2996,9 @@ if menu == "종합 관제":
                     </div>
                     <div style="font-size: 13px; color: #94a3b8; display:flex; align-items:center;">
                         <span style="font-size:15px; margin-right:8px;">⚡</span> <b>상관분석 점수:</b> <span style="color:{card_theme['score_color']}; font-weight:800; font-size:16px; margin-left:6px;">{selected_inc.score}점</span>
+                    </div>
+                    <div style="font-size: 13px; color: #94a3b8; display:flex; align-items:center;">
+                        <span style="font-size:15px; margin-right:8px;">🕒</span> <b>발생 시각:</b> <span style="color:#e2e8f0; font-weight:700; font-size:13px; margin-left:6px;">{inc_created_time}</span>
                     </div>
                 </div>
             </div>
@@ -3549,6 +3650,9 @@ elif menu == "중앙 서버 파이프라인":
                 ).reset_index().rename(columns={"pc_name":"PC 이름", "local_ip":"로컬 IP", "log_count":"조회된 건수", "last_event":"마지막 발생 시각 (한국)"})
                 st.dataframe(summary, hide_index=True, use_container_width=True)
                 st.caption("PC 이름이 같을 수 있으므로 IP도 함께 확인하세요. 내부 IP도 네트워크마다 중복될 수 있습니다.")
+
+            from gigang.ui.site_access import render as render_site_access
+            render_site_access(_RAILWAY_BASE_URL, _RAILWAY_API_KEY)
 
             col_filter1, col_filter2 = st.columns(2)
             with col_filter1:

@@ -48,6 +48,7 @@ from gigang.schemas.incident import (
     Incident, Severity, IncidentCategory, IncidentStatus, NetworkHop, RiskState
 )
 from gigang.engine.respond import on_risk_state_changed
+from gigang.engine import policy as dept_policy
 from gigang.storage.sqlite_store import SQLiteStore
 
 # 상태별 만료 주기 (TTL)
@@ -69,6 +70,34 @@ SENSITIVE_TABLES = {"customer_info", "customer_vault", "corp_strategic_plan", "s
 # ※ 아래 update_user_risk() 에서는 이 목록에 없어도 도메인 이름에 'ai', 'gpt' 등이
 #   들어 있으면 같은 취급을 한다(신규 AI 사이트가 계속 생기기 때문).
 KNOWN_AI_DOMAINS = {"chatgpt.com", "api.openai.com", "claude.ai", "wetransfer.com", "dropbox.com"}
+
+# [수정됨] AI·파일공유 판단 기준.
+# 예전에는 도메인에 'ai', 'box', 'drive' 글자가 들어 있기만 하면 AI/클라우드로 봤다.
+# 그러면 mail.google.com, 기밀 DB 주소(tail2bbbea.ts.net), xbox.com 같은 일반 도메인까지 걸려
+# '기밀 DB + AI 접속' 조건이 엉뚱하게 성립했다. 이제 이름 단위로 본다.
+GENERATIVE_AI_KEYWORDS = ("chatgpt", "openai", "claude", "gemini", "copilot", "perplexity", "gpt")
+FILE_SHARING_DOMAINS = ("wetransfer.com", "dropbox.com", "box.com", "drive.google.com", "onedrive.live.com", "1drv.ms", "mega.nz")
+
+
+def _same_or_sub(domain: str, base: str) -> bool:
+    return domain == base or domain.endswith("." + base)
+
+
+def is_generative_ai(domain: str) -> bool:
+    """생성형 AI 도메인인가. 목록(하위 도메인 포함) / AI 서비스 이름 / .ai 도메인 / 'ai' 이름 칸(ai.google.dev).
+    KNOWN_AI_DOMAINS 의 파일공유(dropbox 등)는 여기서 뺀다."""
+    domain = (domain or "").lower().strip(".")
+    labels = domain.split(".")
+    known_ai = [d for d in KNOWN_AI_DOMAINS if not any(_same_or_sub(d, s) for s in FILE_SHARING_DOMAINS)]
+    return (any(_same_or_sub(domain, known) for known in known_ai)
+            or any(k in domain for k in GENERATIVE_AI_KEYWORDS)
+            or (len(labels) > 1 and "ai" in labels))
+
+
+def is_ai_or_file_sharing(domain: str) -> bool:
+    """미승인 AI 또는 파일공유 서비스인가. (파일 업로드·외부 전송 판정용)"""
+    domain = (domain or "").lower().strip(".")
+    return is_generative_ai(domain) or any(_same_or_sub(domain, s) for s in FILE_SHARING_DOMAINS)
 
 # DB 로그인 계정 <-> 사원/단말 마스터 계정(Windows Agent User) 매핑 테이블
 # DB 감사 로그의 원본 user_name(sales_user, report_user)을 보존하면서
@@ -108,6 +137,20 @@ class CorrelationEngine:
         # 사용자별 최근 민감 행위 메모리 캐시 (DB 조회 기록 등)
         self.user_sensitive_db_touch: Dict[str, datetime] = {}
         self.user_visited_unapproved_ai: Dict[str, Dict[str, Any]] = {}
+
+        # [추가됨] 기밀 DB 반출 판정용 (policy.py)
+        #   AI 접속 기록과, 아직 짝이 될 AI 접속이 없어 판정을 미룬 복사·캡처
+        self.policy = dept_policy.load_policy()
+        self.user_ai_accesses: Dict[str, List[tuple]] = {}
+        self.pending_db_exports: Dict[str, List[SecurityEvent]] = {}
+        #   기밀 DB에서 받은 파일 (DL-3: 이 파일을 AI에 올리면 HIGH)
+        self.user_db_downloads: Dict[str, List[Dict[str, Any]]] = {}
+        #   기밀 DB 복사 (COM-3: 기록만 이어도 같은 글 AI 붙여넣기 시 HIGH)
+        self.user_db_copies: Dict[str, List[Dict[str, Any]]] = {}
+        #   기밀 DB 복사·다운로드 건수 (평소 건수 usual_count_minutes 창 누적용)
+        self.user_db_counts: Dict[str, List[Dict[str, Any]]] = {}
+        #   DB 감사 로그 조회 후 AI 접속 상황을 이미 남긴 조회 시각 (같은 조회로 중복 기록 안 되게)
+        self._db_touch_noted: Dict[str, datetime] = {}
 
         # 이미 판정을 끝낸 event_id 모음
         self._processed_event_ids: set = set()
@@ -169,6 +212,7 @@ class CorrelationEngine:
         Railway 중앙 서버에서 수집된 실제 로그를 분석하여 보안 이벤트로 변환 및 상관분석을 수행합니다.
         """
         from gigang.collectors.team_collector import get_team_security_events
+        self.refresh_policy()
         events = get_team_security_events()
         if events:
             self.ingest_events(sorted(events, key=lambda e: e.timestamp))
@@ -250,7 +294,7 @@ class CorrelationEngine:
         #     기밀 테이블을 조회했다면, 그 '시각'만 메모리에 적어두고 여기서 끝낸다.
         #     조회 자체는 정상 업무일 수 있으므로 아직 상태를 올리지 않는다.
         #     나중에 AI 접속 이벤트가 들어왔을 때 이 기록과 짝을 맞춘다(2.3 참고).
-        if event.log_source == LogSource.DB and event.action == EventAction.SELECT:
+        if getattr(event, "log_source", None) == LogSource.DB and event.action == EventAction.SELECT:
             tbl = event.payload.table_name or ""
             query = event.payload.query_string or ""
             # 테이블명이 기밀 목록에 있거나, 쿼리문에 민감 키워드가 섞여 있으면 기밀 조회로 본다
@@ -271,27 +315,129 @@ class CorrelationEngine:
         #     (GIGANG의 '조건을 모두 만족했을 때만 올린다' 원칙과 같은 맥락이다)
         #
         # 붙여넣은 내용 자체는 수집하지도 저장하지도 않는다. 길이와 패턴 개수만 쓴다.
+        # --- [통합: 이미지 OCR / 내용 일치 가드] ---
+        if event.action == EventAction.DB_IMAGE_CAPTURE:
+            if (event.target.domain == 'desktop-oli.tail2bbbea.ts.net' and
+                    (event.payload.extra or {}).get('detection_scope') == 'db_image_content' and
+                    old_state not in ('HIGH', 'CRITICAL')):
+                self._apply_state_transition(user, old_state, 'WATCH', 70,
+                    ['사내 DB 내용이 포함된 이미지 캡처가 감지되었습니다.', '내부자유출 의심 1단계 (외부 전송 아님)'], event)
+            return
+
+        image_guard = (event.payload.extra or {}).get('image_guard')
+        if isinstance(image_guard, dict) and image_guard.get('outcome') in ('held_error', 'no_match'):
+            return
+
+        link = (event.payload.extra or {}).get('match')
+        if (event.action in (EventAction.PASTE_ATTEMPT, EventAction.FILE_UPLOAD_ATTEMPT)
+                and (event.payload.extra or {}).get('match_status') == 'matched'
+                and isinstance(link, dict)
+                and link.get('source_domain') == 'desktop-oli.tail2bbbea.ts.net'
+                and event.target.domain != link['source_domain']):
+            label = '텍스트 붙여넣기' if event.action == EventAction.PASTE_ATTEMPT else '파일 업로드'
+            if isinstance(image_guard, dict) and image_guard.get('outcome') == 'blocked_match':
+                label = '이미지 첨부 (OCR 내용 일치, 전송 전 차단됨)'
+            reasons = [f'사내 DB 자료와 내용이 일치하는 외부 {label} 시도',
+                       f"출처: {link['source_domain']}{link.get('source_path', '')}",
+                       f"대상: {event.target.domain}",
+                       '내용 일치 감지이며 외부 전송 완료를 의미하지 않습니다.']
+            if old_state not in ('HIGH', 'CRITICAL'):
+                self._apply_state_transition(user, old_state, 'HIGH', 93, reasons, event)
+            self._record_matched_attempt(user, event, reasons)
+            return
+
+        if event.action in (EventAction.COPY_ATTEMPT, EventAction.DOWNLOAD_STARTED):
+            extra = event.payload.extra or {}
+            expected_path = '/db' if event.action == EventAction.COPY_ATTEMPT else '/db/download'
+            if (getattr(event, "log_source", None) != LogSource.CHROME_EXTENSION or
+                event.target.domain != 'desktop-oli.tail2bbbea.ts.net' or
+                extra.get('source_path') != expected_path):
+                return
+            if event.action == EventAction.COPY_ATTEMPT and extra.get('detection_scope') != 'customer_table':
+                return
+            if old_state not in ('NORMAL', 'WATCH'):
+                return
+            action_label = '고객 표 복사 시도' if event.action == EventAction.COPY_ATTEMPT else '고객 엑셀 다운로드 시도'
+            self._apply_state_transition(user, old_state, 'WATCH', 70,
+                [f'사내 DB {action_label}', '사내 내부자유출 방지 정책에 따른 감시 단계 (유출 확정 아님)'], event)
+            return
+
         if event.action == EventAction.PASTE_ATTEMPT:
             self._handle_paste_attempt(user, old_state, event)
+            return
+
+        # 2.1-c 기밀 DB 복사·화면 캡처·다운로드 (Agent)  [추가됨]
+        #   AI 접속 시간창 안이면 부서 정책으로 판정, 아니면 AI 접속이 들어올 때까지 미뤄 둔다.
+        #   다운로드는 시간창과 상관없이 파일 이름·크기를 기억해 둔다 (DL-3).
+        if event.action in (EventAction.CLIPBOARD_COPY, EventAction.SCREEN_CAPTURE, EventAction.DB_DOWNLOAD):
+            if event.action == EventAction.DB_DOWNLOAD and event.payload.file_name:
+                downloads = self.user_db_downloads.setdefault(user, [])
+                downloads.append({"name": event.payload.file_name, "size": event.payload.file_size,
+                                  "source": event.target.domain or "unknown", "time": event.timestamp})
+                del downloads[:-200]
+            if event.action == EventAction.CLIPBOARD_COPY:
+                try:
+                    length = int((event.payload.extra or {}).get("text_length") or 0)
+                except (ValueError, TypeError):
+                    length = 0
+                copies = self.user_db_copies.setdefault(user, [])
+                copies.append({"id": event.event_id, "time": event.timestamp, "length": length,
+                               "source": event.target.domain or "unknown", "rules": []})
+                del copies[:-200]
+            if event.action in (EventAction.CLIPBOARD_COPY, EventAction.DB_DOWNLOAD):
+                counted = self.user_db_counts.setdefault(user, [])
+                counted.append({"id": event.event_id, "time": event.timestamp,
+                                "counts": dept_policy.effective_counts(
+                                    (event.payload.extra or {}).get("pattern_hits") or {}, self.policy)})
+                del counted[:-500]
+            self._handle_db_export(user, event)
             return
 
         # 2.2 파일 업로드 시도 또는 외부 데이터 전송 발생 포착 (Chrome Extension / Firewall ALLOW / Web POST)
         target_domain = event.target.domain or ""
 
+        # 2.1-d DL-3: 기밀 DB에서 받은 파일을 생성형 AI에 업로드 → 부서·상태와 상관없이 HIGH  [추가됨]
+        if event.action == EventAction.FILE_UPLOAD_ATTEMPT and is_generative_ai(target_domain):
+            result = dept_policy.judge_upload(
+                event.payload.file_name, event.payload.file_size, target_domain,
+                (event.payload.extra or {}).get("confidential_source"), self.user_db_downloads.get(user, []),
+                self.policy["score"])
+            if result is not None:
+                inc = self._create_dynamic_incident(
+                    user, event, event.payload.file_size or 0,
+                    title_prefix="[DL-3 기밀 DB 다운로드 파일]",
+                    evidence_note=f"{result.reasons[0]} (+4점)")
+                new_state = old_state if old_state == "CRITICAL" else "HIGH"
+                self._apply_state_transition(user, old_state, new_state, result.score, result.reasons, event, incident=inc)
+                if new_state == old_state:
+                    # 이미 HIGH 이상이면 전이 기록이 남지 않으므로 근거를 따로 남긴다
+                    self.store.append_history(user, old_state, old_state, " / ".join(result.reasons))
+                return
+
+        # 2.2-a 생성형 AI 접속 기록 + 미뤄 둔 기밀 DB 복사·캡처 판정  [추가됨]
+        #   "DB 복사 → AI 켜기" 순서는 복사 시점엔 짝이 없으므로 여기서 다시 본다.
+        #   WATCH 가 됐으면 아래 기존 판정은 건너뛴다 (같은 이벤트로 두 번 전이하지 않게).
+        if event.log_source in (LogSource.DNS, LogSource.WEB, LogSource.WINDOWS_AGENT) \
+                and event.action not in (EventAction.FILE_UPLOAD_ATTEMPT,) and is_generative_ai(target_domain):
+            self.user_ai_accesses.setdefault(user, []).append((event.timestamp, target_domain))
+            if self._judge_pending_exports(user, event.timestamp):
+                return
+
         # 이 도메인이 미승인 AI 또는 파일공유 서비스인가?
         # 등록된 목록에 있거나, 도메인 이름에 ai/gpt/claude 같은 단어가 들어 있으면 그렇다고 본다.
         # 새 AI 사이트가 매일 생기므로 목록만으로는 부족해서 이름 검사도 함께 한다.
-        is_ai_or_cloud = target_domain in KNOWN_AI_DOMAINS or any(k in target_domain.lower() for k in ["ai", "gpt", "claude", "gemini", "transfer", "dropbox", "box", "drive"])
+        is_ai_or_cloud = is_ai_or_file_sharing(target_domain)
 
         file_name = event.payload.file_name or ""
         file_size = event.payload.file_size or event.payload.bytes_sent or 0
         bytes_out = event.payload.bytes_sent or file_size or 0
 
         # '파일을 첨부하려 했는가' 판정
-        # 크롬 확장에서 온 로그이거나 파일명이 있으면 파일 첨부로 본다.
+        # 파일 첨부 이벤트이거나 파일명이 있으면 파일 첨부로 본다.
+        # [수정됨] 예전에는 크롬 확장에서 온 로그를 전부 파일 첨부로 봤다. 그래서 확장이 보낸
+        #   기밀 DB 사이트의 복사(COPY_ATTEMPT, 옛 확장)가 "기밀 DB 사이트로 유출 확정" HIGH 가 됐다.
         is_file_upload = (
             event.action == EventAction.FILE_UPLOAD_ATTEMPT or
-            event.log_source == LogSource.CHROME_EXTENSION or
             bool(file_name)
         )
 
@@ -366,28 +512,13 @@ class CorrelationEngine:
                     self._apply_state_transition(user, old_state, new_state, score, reasons, event, incident=inc)
                     return
                 elif is_file_upload and is_ai_or_cloud:
-                    # 미승인 AI 사이트에 파일 업로드 시도한 경우 -> 단독 고위험 징후로 즉시 WATCH 승격
-                    # (기밀 DB 조회 이력은 없지만, 미승인 AI에 파일을 올리는 것 자체가 위험 신호)
-                    new_state = "WATCH"
-                    score = 82
-                    reasons = [
-                        f"미승인 생성형 AI({target_domain})로의 파일 첨부 시도 감지 (Chrome Extension)",
-                        f"첨부 파일: '{file_name}' ({file_size / 1024:.1f} KB)" if file_size else f"첨부 파일: '{file_name}'",
-                        "프롬프트 및 문서 업로드를 통한 비인가 사내 자산 외부 유출 위험 선제 감시"
-                    ]
-                    self._apply_state_transition(user, old_state, new_state, score, reasons, event)
-                    return
-                elif bytes_out >= 1_000_000:
-                    # 사전 등록 없는 단독 대용량 이상 전송 감지 (Outbound Spike)
-                    # 아무 정황 없이 갑자기 1MB 넘게 외부로 나가면 그 자체로 이상 징후로 본다.
-                    # ※ 1MB라는 기준은 코드에 고정되어 있다. 팀에서 확정한 임계치는 아니다.
-                    new_state = "WATCH"
-                    score = 72
-                    reasons = [
-                        f"비인가 외부 서비스로의 단독 비정상 대용량 전송 포착 ({bytes_out / (1024*1024):.2f} MB)",
-                        "임계치(1MB) 초과 Outbound Traffic Spike 단독 이상 징후 감지"
-                    ]
-                    self._apply_state_transition(user, old_state, new_state, score, reasons, event)
+                    # [수정됨 10-06] 예전에는 기밀 DB 이력 없이 AI 파일 업로드 하나만으로 WATCH(82),
+                    #   1MB 넘는 단독 전송만으로 WATCH(72)로 올렸다. 그러면 기밀 DB와 무관한 업로드 두 번이
+                    #   WATCH → HIGH "유출 확정"이 됐다. WATCH 는 기밀 DB 반출(부서 규칙·SS·DL, DB 조회+AI)에서만
+                    #   생기게 하고, 여기서는 정황 기록만 남긴다. 기밀 DB에서 받은 파일 업로드는 위 DL-3 이 잡는다.
+                    size = f" ({file_size / 1024:.1f} KB)" if file_size else ""
+                    self.store.append_history(user, old_state, old_state,
+                                              f"[기록] 생성형 AI·파일공유({target_domain}) 파일 첨부 '{file_name}'{size} · 기밀 DB 연관 없음")
                     return
 
         # 2.3 미승인 AI / 외부 SaaS 단순 접근 및 질의 포착 (전송 이전 선제 감시)
@@ -411,18 +542,109 @@ class CorrelationEngine:
             #   이제 self.time_window 하나로 통일했다.
             db_touch_time = self.user_sensitive_db_touch.get(user)
             if db_touch_time and (event.timestamp - db_touch_time) <= self.time_window:
-                # 🌟 [1단계] WATCH 상태 전이 (전송 이전 선제 감시)
-                #    아직 단 1바이트도 나가지 않았지만 감시를 시작한다.
-                new_state = "WATCH"
-                score = 68
-                window_min = int(self.time_window.total_seconds() // 60)
-                reasons = [
-                    f"사내 기밀 DB({event.actor.user_id or '단말'}) SELECT 조회 선행",
-                    f"{window_min}분 내 미승인 외부 서비스({target_domain}) 접근 포착",
-                    "데이터 외부 반출 위험으로 사전 감시 승격"
-                ]
-                self._apply_state_transition(user, old_state, new_state, score, reasons, event)
+                # [정리 10-06] 전엔 여기서 WATCH(68)로 올렸다. 그러나
+                #   ① 부서별로 본 'DB 조회 + AI 접속' 은 WATCH 일 수도 있고(HR-1 은 일상) WATCH 일 수도 있고
+                #      자기가 쓴 글 붙여넣어도 HIGH 가 아니다 (부서 기준 무력화).
+                #   ② AI 탭이 백그라운드에 켜져 있으면 로그가 또 와서 HIGH 가 도로 WATCH 로 내려간다 (등급 강등 버그).
+                #   ③ DB 복사는 Agent 가 보낸 복사·캡처·다운로드 건(policy.py)이 부서별로 판정한다.
+                #   여기서는 조회 1건이라는 정황만 이력에 남긴다.
+                if self._db_touch_noted.get(user) != db_touch_time:
+                    self._db_touch_noted[user] = db_touch_time
+                    window_min = int(self.time_window.total_seconds() // 60)
+                    self.store.append_history(user, old_state, old_state,
+                                              f"[기록] 사내 기밀 DB SELECT 조회 후 {window_min}분 안에 AI({target_domain}) 접속 "
+                                              "(DB 감사 로그) · 상태 판정은 기밀 DB 복사·캡처·다운로드 규칙으로")
                 return
+
+    # ------------------------------------------------------------------
+    # 기밀 DB 복사·화면 캡처 판정  [추가됨]  (규칙은 policy.py 에 있다)
+    # ------------------------------------------------------------------
+
+    def refresh_policy(self) -> None:
+        """
+        Railway 정책 표를 5분마다 다시 읽는다. 못 읽으면 로컬 department_policy.json 그대로.
+        표 값만 고치면 재배포 없이 반영된다. (계획서 5장 구현 원칙)
+        """
+        now = datetime.utcnow()
+        if getattr(self, "_policy_checked_at", None) and now - self._policy_checked_at < timedelta(minutes=5):
+            return
+        self._policy_checked_at = now
+        from gigang.collectors.team_collector import fetch_railway_policy
+        self.policy = dept_policy.merge_remote(dept_policy.load_policy(), fetch_railway_policy())
+
+    def _handle_db_export(self, user: str, event: SecurityEvent) -> None:
+        """복사·캡처 하나를 판정한다. 짝이 될 AI 접속이 아직 없으면 미뤄 둔다."""
+        if self._apply_db_export(user, event, self.user_ai_accesses.get(user, [])) is None:
+            self.pending_db_exports.setdefault(user, []).append(event)
+
+    def _judge_pending_exports(self, user: str, ai_time: datetime) -> bool:
+        """
+        AI 접속이 들어왔을 때, 그 전에 미뤄 둔 복사·캡처를 다시 판정한다.
+        이 AI 접속보다 '전 N분'보다 오래된 것은 앞으로도 짝이 생기지 않으므로 버린다.
+        WATCH 전이가 하나라도 있었으면 True.
+        """
+        pending = self.pending_db_exports.get(user)
+        if not pending:
+            return False
+        oldest = ai_time - timedelta(minutes=self.policy["window_before_minutes"])
+        watched, left = False, []
+        for ev in pending:
+            if ev.timestamp < oldest:
+                continue
+            level = self._apply_db_export(user, ev, self.user_ai_accesses.get(user, []))
+            if level is None:
+                left.append(ev)
+            elif level == "WATCH":
+                watched = True
+        self.pending_db_exports[user] = left
+        return watched
+
+    def _record_matched_attempt(self, user: str, event: SecurityEvent, reasons: list) -> None:
+        is_image = ((event.payload.extra or {}).get('image_guard') or {}).get('outcome') == 'blocked_match'
+        match_info = (event.payload.extra or {}).get('match') or {}
+        trace_id = match_info.get('source_trace_id', 'unknown')
+        inc = Incident(
+            incident_id=self._next_incident_id('INC-MATCH'),
+            title=f"사내 자료 내용 일치 외부 입력 시도 - {user}",
+            category=IncidentCategory.INSIDER_DATA_THEFT,
+            severity=Severity.HIGH, score=93, status=IncidentStatus.ACTIVE,
+            summary=('화면 OCR로 사내 DB 화면 내용과 일치하는 이미지가 발견되어 첨부 전 차단되었습니다. 외부 전송 완료를 의미하지 않습니다.' if is_image else '확장 프로그램이 사내 복사/붙여넣기 또는 다운로드/업로드 시도를 감지했습니다. 전송 완료는 확인되지 않았습니다.'),
+            actor=user, target_asset=event.target.domain or 'external', created_at=event.timestamp,
+            event_ids=[event.event_id], evidences=reasons + [
+                ('사내 DB 캡처 추적 ID: ' if is_image else '사내 활동 ID: ') + str(trace_id)],
+            network_hops=[], soar_actions=[])
+        self.incidents[inc.incident_id] = inc
+        self.store.save_incident(inc)
+
+    def _apply_db_export(self, user: str, event: SecurityEvent, ai_accesses: List[tuple]) -> Optional[str]:
+        """policy.judge() 결과를 상태에 반영하고 등급("WATCH"/"RECORD")을 돌려준다. 시간창 밖이면 None."""
+        since = event.timestamp - timedelta(minutes=self.policy["usual_count_minutes"])
+        prior: Dict[str, int] = {}
+        for item in self.user_db_counts.get(user, []):
+            if item["id"] != event.event_id and since <= item["time"] <= event.timestamp:
+                for key, n in item["counts"].items():
+                    prior[key] = prior.get(key, 0) + n
+        result = dept_policy.judge(
+            event.action.value, event.timestamp, user, event.payload.extra or {},
+            event.target.domain or "unknown", ai_accesses, self.policy, prior,
+        )
+        if result is None:
+            return None
+        for copy in self.user_db_copies.get(user, []):
+            if copy["id"] == event.event_id:
+                copy["rules"] = result.rules        # COM-3 근거에 "어떤 규칙으로 기록됐던 복사인지" 남기려고
+        current_risk = self.store.get_active_risk(user)
+        old_state = current_risk["state"] if current_risk else "NORMAL"
+        # 이미 HIGH 이상이면 WATCH 로 내리지 않고 기록만 남긴다
+        if result.level == "WATCH" and old_state not in ("HIGH", "CRITICAL"):
+            self._apply_state_transition(user, old_state, "WATCH", result.score, result.reasons, event)
+            if old_state == "WATCH":
+                # 이미 WATCH 면 위 전이는 감시 시간만 늘리고 이력을 안 남긴다 (알림 중복 방지).
+                # 캡처·다운로드 같은 추가 반출 근거는 감사에 필요하므로 이력에는 남긴다.
+                self.store.append_history(user, old_state, old_state, "[추가 근거] " + " / ".join(result.reasons))
+        else:
+            self.store.append_history(user, old_state, old_state, "[기록] " + " / ".join(result.reasons))
+        return result.level
 
     # ------------------------------------------------------------------
     # 붙여넣기(PASTE_ATTEMPT) 판정  [추가됨]
@@ -476,17 +698,34 @@ class CorrelationEngine:
         if not isinstance(pattern_hits, dict):
             pattern_hits = {}
 
+        # [추가됨] 캡처 이미지 붙여넣기. 장수와 크기만 온다.
+        try:
+            image_count = int(extra.get("image_count", 0) or 0)
+            image_bytes = int(extra.get("image_bytes", 0) or 0)
+        except (ValueError, TypeError):
+            image_count, image_bytes = 0, 0
+
         target_domain = event.target.domain or "unknown"
         hits_str = self._format_pattern_hits(pattern_hits)
 
         # 두 경우 모두에 들어가는 공통 근거.
         # 마지막 줄은 감사나 발표에서 "내용을 봤느냐"는 질문에 답하기 위해 일부러 남긴다.
-        base_reasons = [
-            f"미승인 생성형 AI({target_domain})에 대량 텍스트 붙여넣기 감지 (Chrome Extension)",
-            f"붙여넣은 문자 수: {text_length:,}자",
-            f"민감정보 패턴 검출: {hits_str}",
-            "붙여넣은 내용 자체는 수집·저장하지 않음 (길이와 패턴 검출 개수만 기록)",
-        ]
+        if not image_count:
+            base_reasons = [
+                f"미승인 생성형 AI({target_domain})에 대량 텍스트 붙여넣기 감지 (Chrome Extension)",
+                f"붙여넣은 문자 수: {text_length:,}자",
+                f"민감정보 패턴 검출: {hits_str}",
+                "붙여넣은 내용 자체는 수집·저장하지 않음 (길이와 패턴 검출 개수만 기록)",
+            ]
+        else:
+            what = "텍스트·이미지" if text_length else "이미지"
+            base_reasons = [
+                f"미승인 생성형 AI({target_domain})에 {what} 붙여넣기 감지 (Chrome Extension)",
+                f"붙여넣은 이미지: {image_count}장, {image_bytes / 1024:,.1f} KB",
+            ]
+            if text_length:
+                base_reasons += [f"붙여넣은 문자 수: {text_length:,}자", f"민감정보 패턴 검출: {hits_str}"]
+            base_reasons.append("붙여넣은 내용 자체는 수집·저장하지 않음 (길이·이미지 크기와 패턴 검출 개수만 기록)")
 
         if old_state == "WATCH":
             # 🌟 [2단계] 이미 감시 중이던 사용자가 붙여넣었다.
@@ -495,6 +734,15 @@ class CorrelationEngine:
             reasons = ["사전 감시(WATCH) 등록 사용자의 붙여넣기 전송 확인"] + base_reasons
             self._apply_state_transition(user, old_state, "HIGH", 93, reasons, event)
             return
+
+        # COM-3: WATCH 가 아니어도(기록만으로 끝난 평소 업무 복사라도) 그 기밀 DB 복사 내용을 AI 에 붙여넣으면 HIGH.
+        #   같은 내용인지는 글자 수로 맞춘다 (policy.judge_paste_after_copy).
+        if old_state not in ("HIGH", "CRITICAL") and is_generative_ai(target_domain):
+            result = dept_policy.judge_paste_after_copy(self.user_db_copies.get(user, []), event.timestamp,
+                                                        text_length, target_domain, self.policy)
+            if result is not None:
+                self._apply_state_transition(user, old_state, "HIGH", result.score, result.reasons + base_reasons, event)
+                return
 
         # NORMAL(또는 이미 HIGH 이상) 상태 → 상태는 그대로 두고 기록만 남긴다.
         # from_state 와 to_state 를 같게 넣어 "전이 없이 관찰만 했다"는 뜻을 남긴다.
