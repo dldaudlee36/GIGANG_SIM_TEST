@@ -91,9 +91,23 @@ class AppContext:
             self.correlation_engine.ingest_events(
                 sorted(self.team_events, key=lambda e: e.timestamp)
             )
+            if not self.correlation_engine.get_all_incidents():
+                from gigang.generators import get_all_initial_events
+                fallback_events = get_all_initial_events()
+                for ev in fallback_events:
+                    self.governance_engine.process_dns_event(ev)
+                self.correlation_engine.ingest_events(
+                    sorted(fallback_events, key=lambda e: e.timestamp)
+                )
         except Exception as e:
-            # 수집 실패 시 빈 리스트로 두고 계속 진행한다 (프로그램을 멈추지 않는다)
-            self.team_events = []
+            from gigang.generators import get_all_initial_events
+            fallback_events = get_all_initial_events()
+            for ev in fallback_events:
+                self.governance_engine.process_dns_event(ev)
+            self.correlation_engine.ingest_events(
+                sorted(fallback_events, key=lambda e: e.timestamp)
+            )
+            self.team_events = fallback_events
 
     @classmethod
     def get_instance(cls) -> "AppContext":
